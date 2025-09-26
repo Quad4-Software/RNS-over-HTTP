@@ -99,13 +99,16 @@ class Server(AbstractTunnel):
                         self.tunnel.logger.debug(f"Received {len(client_data)} bytes from client")
                         self.tunnel._recv_queue.put(client_data)
                     
-                    server_data = b""
-                    if not self.tunnel._send_queue.empty():
+                    server_data_parts = []
+                    while not self.tunnel._send_queue.empty():
                         try:
-                            server_data = self.tunnel._send_queue.get_nowait()
-                            self.tunnel.logger.debug(f"Sending {len(server_data)} bytes to client")
+                            server_data_parts.append(self.tunnel._send_queue.get_nowait())
                         except Empty:
-                            pass
+                            break
+                    
+                    server_data = b"".join(server_data_parts)
+                    if server_data:
+                        self.tunnel.logger.debug(f"Sending {len(server_data)} bytes ({len(server_data_parts)} chunks) to client")
                     
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/octet-stream')
