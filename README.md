@@ -17,8 +17,7 @@ This could be used to bypass firewalls, DPI, and other restrictions. Make sure t
 
 Dependencies:
 
-Python 3.9+
-Requests
+Python 3.9+ and Requests
 
 ## Configuration
 
