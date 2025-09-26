@@ -69,3 +69,7 @@ By default, the server validates that incoming requests include the correct User
 - Unauthorized data collection
 
 You can disable this check with `--disable-user-agent-check`
+
+## License
+
+[MIT License](LICENSE)
