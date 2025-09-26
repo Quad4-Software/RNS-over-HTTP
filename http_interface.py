@@ -1,3 +1,9 @@
+"""
+RNS-over-HTTP Interface
+
+HTTP interface for Reticulum that implements bidirectional communication using HTTP POST requests.
+"""
+
 import logging
 import logging.handlers
 import sys
