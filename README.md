@@ -51,6 +51,40 @@ Python 3.9+ and Requests
     name = HTTP Interface
 ```
 
+### Example using Caddy
+
+#### Using a main domain
+
+```
+example.com {
+    reverse_proxy 127.0.0.1:8080
+
+    header {
+        # Remove server identification
+        -Server
+        # Add security headers
+        X-Content-Type-Options nosniff
+    }
+}
+```
+
+#### Using a subdomain
+
+```
+api1.example.com {
+    reverse_proxy 127.0.0.1:8080
+
+    header {
+        # Remove server identification
+        -Server
+        # Add security headers
+        X-Content-Type-Options nosniff
+    }
+}
+```
+
+more examples will be available soon.
+
 ### Options
 
 - `--mtu`: Maximum transmission unit (default: 4096 bytes)
