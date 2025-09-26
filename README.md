@@ -2,6 +2,8 @@
 
 This Reticulum Interface allows using HTTP POST requests as a bidirectional transport layer. It consists of two parts: a client and a server. The server must have a public IP address and be accessible via HTTP. The client only needs internet access. One server can serve any number of clients.
 
+This could be used to bypass firewalls, DPI, and other restrictions. Make sure to adapt the user-agent accordingly or disable it. 
+
 ## Features
 
 - Bidirectional communication
@@ -13,17 +15,16 @@ This Reticulum Interface allows using HTTP POST requests as a bidirectional tran
 
 ## Setup
 
-Install dependencies:
+Dependencies:
 
-```bash
-pip install requests
-```
+Python 3.9+
+Requests
 
 ## Configuration
 
-1. Download http_interface.py to ~/.reticulum/interfaces/
+1. Download http_interface.py to `~/.reticulum/interfaces/` or wherever you want to store it.
 
-2. Add a PipeInterface to your `~/.reticulum/config` file on both the server and the client.
+2. Add a PipeInterface to your `~/.reticulum/config` file on both the server and the client and update the path to the http_interface.py file, as well as the server and client URLs.
 
 ### Client Configuration
 
