@@ -4,6 +4,8 @@
 
 A Reticulum interface that tunnels traffic over standard HTTP/S POST requests. This allows Reticulum to operate on networks where only web traffic is permitted, effectively bypassing firewalls, DPI, and other restrictions.
 
+[Non-GitHub Mirror](https://lavaforge.org/Ivan/RNS-over-HTTP). Also available on the network `RNS-over-HTTP` node.
+
 ## Overview
 
 RNS-over-HTTP creates a bidirectional transport layer using a simple client-server model:
