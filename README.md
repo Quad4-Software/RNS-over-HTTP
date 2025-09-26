@@ -1,5 +1,7 @@
 # RNS-over-HTTP
 
+[Русский](README-RU.md)
+
 A Reticulum interface that tunnels traffic over standard HTTP/S POST requests. This allows Reticulum to operate on networks where only web traffic is permitted, effectively bypassing firewalls, DPI, and other restrictions.
 
 ## Overview
