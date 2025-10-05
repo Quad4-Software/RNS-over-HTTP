@@ -51,7 +51,7 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
     ```
 
 2.  **Install the custom interface:**
-    Place `http_interface.py` in your Reticulum interfaces directory: `~/.reticulum/interfaces/`.
+    Place `HTTPInterface.py` in your Reticulum interfaces directory: `~/.reticulum/interfaces/`.
 
 ## Configuration
 
