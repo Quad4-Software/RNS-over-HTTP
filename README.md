@@ -2,7 +2,7 @@
 
 [Русский](README-RU.md)
 
-A Reticulum interface that tunnels traffic over standard HTTP/S POST requests. This allows Reticulum to operate on networks where only web traffic is permitted, effectively bypassing firewalls, DPI, and other restrictions.
+A custom Reticulum interface that tunnels traffic over standard HTTP/S POST requests. This allows Reticulum to operate on networks where only web traffic is permitted, effectively bypassing firewalls, DPI, and other restrictions.
 
 [Non-GitHub Mirror](https://lavaforge.org/Ivan/RNS-over-HTTP). Also available on the network `RNS-over-HTTP` node.
 
@@ -40,35 +40,37 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
 ### Requirements
 
 -   Python 3.9 or later
--   `pip` for installing packages
+-   `rns`
+-   `requests`
 
 ### Installation
 
-1.  **Install the `requests` library if not already installed:**
+1.  **Install Reticulum and dependencies:**
     ```bash
-    pip install requests
+    pip install rns requests
     ```
 
-2.  **Download the interface script:**
-    Place `http_interface.py` in a known location on both your client and server machines, for example, `~/.reticulum/interfaces/`.
+2.  **Install the custom interface:**
+    Place `http_interface.py` in your Reticulum interfaces directory: `~/.reticulum/interfaces/`.
 
 ## Configuration
 
-Set up a `PipeInterface` in your `~/.reticulum/config` file on both the server and client machines.
+Add an interface entry to your Reticulum configuration file (`~/.reticulum/config`) on both the server and client machines.
 
 ### Server Configuration
 
 The server listens for incoming connections from clients.
 
 ```ini
-[[HTTP Interface]]
-    type = PipeInterface
-    enabled = True
-    # The command to run the server script. Listens on all interfaces by default.
-    command = python3 /path/to/your/http_interface.py server --host 0.0.0.0 --port 8080
-    # Optional: delay before respawning the interface if it crashes.
-    respawn_delay = 5
-    name = HTTP Interface Server
+[[HTTP Server Interface]]
+    type = HTTPInterface
+    enabled = true
+    mode = server
+    listen_host = 0.0.0.0
+    listen_port = 8080
+    mtu = 4096
+    check_user_agent = true
+    user_agent = RNS-HTTP-Tunnel/1.0
 ```
 
 ### Client Configuration
@@ -76,26 +78,36 @@ The server listens for incoming connections from clients.
 The client connects to the server's public URL.
 
 ```ini
-[[HTTP Interface]]
-    type = PipeInterface
-    enabled = True
-    # The command to run the client script. Point --url to your server.
-    command = python3 /path/to/your/http_interface.py client --url http://<your-server-ip-or-domain>
-    # Optional: delay before respawning the interface if it crashes.
-    respawn_delay = 5
-    name = HTTP Interface Client
+[[HTTP Client Interface]]
+    type = HTTPInterface
+    enabled = true
+    mode = client
+    server_url = http://your-server-ip-or-domain:8080
+    poll_interval = 1.0
+    mtu = 4096
+    user_agent = RNS-HTTP-Tunnel/1.0
 ```
 
-## Command-Line Options
+## Configuration Options
 
-You can customize the behavior of the script with these arguments:
+### Common Options
 
--   `--mtu`: Maximum Transmission Unit in bytes (default: `4096`).
--   `--poll-interval`: Client polling interval in seconds (default: `0.1`).
--   `--verbose` or `-v`: Enable verbose debug logging.
--   `--host`: Server listen host (default: `0.0.0.0`).
--   `--port`: Server listen port (default: `8080`).
--   `--disable-user-agent-check`: Disable User-Agent validation on the server.
+-   `mtu`: Maximum Transmission Unit in bytes (default: `4096`).
+-   `name`: Interface name for logging and identification.
+-   `user_agent`: User-Agent string to use for HTTP requests (default: `"RNS-HTTP-Tunnel/1.0"`).
+
+### Server Mode Options
+
+-   `mode`: Must be set to `server`.
+-   `listen_host`: Host to bind the HTTP server to (default: `0.0.0.0`).
+-   `listen_port`: Port to listen on (default: `8080`).
+-   `check_user_agent`: Whether to validate User-Agent headers (default: `true`).
+
+### Client Mode Options
+
+-   `mode`: Must be set to `client`.
+-   `server_url`: Full URL of the server to connect to (required for client mode).
+-   `poll_interval`: Polling interval in seconds (default: `1.0`).
 
 ## Reverse Proxy Setup (Caddy Example)
 
