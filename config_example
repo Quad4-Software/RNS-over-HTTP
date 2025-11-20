@@ -1,0 +1,67 @@
+# RNS HTTP Tunnel Interface Configuration Examples
+
+# Server Mode Configuration
+# This creates an HTTP server that accepts connections from HTTP tunnel clients
+[[HTTP Tunnel Server]]
+  type = HTTPTunnelInterface
+  interface_enabled = True
+  mode = server
+  listen_host = 0.0.0.0
+  listen_port = 8080
+  check_user_agent = True
+  mtu = 4096
+
+# Server Mode with HTML Page
+# This creates an HTTP server that serves an HTML page on GET requests
+[[HTTP Tunnel Server with HTML]]
+  type = HTTPTunnelInterface
+  interface_enabled = True
+  mode = server
+  listen_host = 0.0.0.0
+  listen_port = 8080
+  check_user_agent = True
+  mtu = 4096
+  serve_html_page = True
+  html_file_path = index.html
+
+# Client Mode Configuration
+# This connects to an HTTP tunnel server
+[[HTTP Tunnel Client]]
+  type = HTTPTunnelInterface
+  interface_enabled = False
+  mode = client
+  server_url = http://example.com:8080/
+  poll_interval = 0.1
+  mtu = 4096
+
+# HTTPS Example (Client)
+# Use this to connect to an HTTPS-enabled server
+[[HTTPS Tunnel Client]]
+  type = HTTPTunnelInterface
+  interface_enabled = False
+  mode = client
+  server_url = https://secure.example.com:443/
+  poll_interval = 0.2
+  check_user_agent = True
+
+# Configuration Options:
+#
+# mode (required):
+#   - "server": Run as HTTP server accepting incoming connections
+#   - "client": Run as HTTP client connecting to a server
+#
+# Server Mode Options:
+#   listen_host: IP address to bind to (default: 0.0.0.0)
+#   listen_port: TCP port to bind to (default: 8080)
+#
+# Client Mode Options:
+#   server_url: Full URL of the HTTP server (required for client mode)
+#   poll_interval: Seconds between polls (default: 0.1)
+#
+# Common Options:
+#   check_user_agent: Validate User-Agent header (default: True)
+#   mtu: Maximum transmission unit in bytes (default: 4096)
+#   serve_html_page: Serve HTML page on GET requests (default: False)
+#   html_file_path: Path to HTML file to serve (required if serve_html_page is True)
+#   interface_enabled: Enable/disable the interface (default: False)
+
