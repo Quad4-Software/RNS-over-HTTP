@@ -85,11 +85,6 @@ class HTTPTunnelInterface(Interface):
         if mode == "client" and server_url is None:
             raise ValueError(f"No server_url specified for client mode in {self}")
 
-        self.HW_MTU = mtu
-        self.online = False
-        self.bitrate = HTTPTunnelInterface.BITRATE_GUESS
-        self.optimise_mtu()
-
         self.owner = owner
         self.mode = mode
         self.mtu = mtu
@@ -104,6 +99,11 @@ class HTTPTunnelInterface(Interface):
         self._recv_queue = Queue()
         self._send_queue = Queue()
         self._stop_event = Event()
+
+        self.HW_MTU = mtu
+        self.online = False
+        self.bitrate = HTTPTunnelInterface.BITRATE_GUESS
+        self.optimise_mtu()
 
         if mode == "server":
             self.listen_host = listen_host
