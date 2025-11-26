@@ -103,15 +103,19 @@ class HTTPTunnelInterface(Interface):
         self.HW_MTU = mtu
         self.online = False
         self.bitrate = HTTPTunnelInterface.BITRATE_GUESS
-        self.optimise_mtu()
 
         if mode == "server":
             self.listen_host = listen_host
             self.listen_port = listen_port
-            self.setup_server()
         else:
             self.server_url = server_url
             self.poll_interval = poll_interval
+
+        self.optimise_mtu()
+
+        if mode == "server":
+            self.setup_server()
+        else:
             self.setup_client()
 
     def _load_html_content(self):
