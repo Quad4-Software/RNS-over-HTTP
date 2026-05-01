@@ -30,7 +30,7 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
 
 -   **Firewall & DPI Evasion**: Tunnels any traffic through standard HTTP/S ports (80/443).
 -   **Bidirectional Communication**: Full-duplex data transfer.
--   **Simple Setup**: No complex dependencies, just Python and `requests`.
+-   **Simple setup**: Python, `requests`, and Reticulum (`rns`); use Poetry in this repo for a tidy dev environment and tests.
 -   **Reliable**: Automatic connection retry with exponential backoff.
 -   **Flexible**: Supports custom MTU sizes and configurable polling intervals.
 -   **Proxy-Friendly**: Works seamlessly behind reverse proxies like Caddy or Nginx.
@@ -40,18 +40,23 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
 ### Requirements
 
 -   Python 3.9 or later
--   `rns`
--   `requests`
+-   [Poetry](https://python-poetry.org/docs/#installation) (for a reproducible dev environment and tests)
 
 ### Installation
 
-1.  **Install Reticulum and dependencies:**
+1.  **Install dependencies with Poetry** (from this repository root):
     ```bash
-    pip install rns requests
+    poetry install
     ```
 
-2.  **Install the custom interface:**
-    Place `HTTPInterface.py` in your Reticulum interfaces directory: `~/.reticulum/interfaces/`.
+2.  **Install the custom interface for Reticulum:**
+    Copy `HTTPInterface.py` into your Reticulum interfaces directory: `~/.reticulum/interfaces/`.
+
+### Tests
+
+```bash
+poetry run pytest
+```
 
 ## Configuration
 

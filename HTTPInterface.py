@@ -90,6 +90,8 @@ class HTTPTunnelInterface(Interface):
             ifconf["html_file_path"] if "html_file_path" in ifconf else None
         )
 
+        self.mode = mode
+
         if mode not in ["client", "server"]:
             raise ValueError(
                 f"Invalid mode '{mode}' for {self}. Must be 'client' or 'server'",
@@ -100,7 +102,6 @@ class HTTPTunnelInterface(Interface):
 
         self.owner = owner
         self.IN = True
-        self.mode = mode
         self.mtu = mtu
         self.check_user_agent = check_user_agent
         self.serve_html_page = serve_html_page
@@ -143,7 +144,8 @@ class HTTPTunnelInterface(Interface):
                 self.html_content = None
         except Exception as e:
             RNS.log(
-                f"Error loading HTML file {self.html_file_path}: {e}", RNS.LOG_ERROR,
+                f"Error loading HTML file {self.html_file_path}: {e}",
+                RNS.LOG_ERROR,
             )
             self.html_content = None
 
@@ -160,7 +162,8 @@ class HTTPTunnelInterface(Interface):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header(
-                        "Content-Length", str(len(interface_instance.html_content)),
+                        "Content-Length",
+                        str(len(interface_instance.html_content)),
                     )
                     self.end_headers()
                     self.wfile.write(interface_instance.html_content.encode("utf-8"))
@@ -224,13 +227,15 @@ class HTTPTunnelInterface(Interface):
                 pass
 
         class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-            pass
+            daemon_threads = True
 
         def run_server():
             try:
                 self._http_server = ThreadedHTTPServer(
-                    (self.listen_host, self.listen_port), TunnelRequestHandler,
+                    (self.listen_host, self.listen_port),
+                    TunnelRequestHandler,
                 )
+                self._http_server.daemon_threads = True
                 self._http_server.serve_forever()
             except Exception as e:
                 if not self._stop_event.is_set():
@@ -290,7 +295,9 @@ class HTTPTunnelInterface(Interface):
             try:
                 RNS.log(f"Sending {len(data_to_send)} bytes to server", RNS.LOG_EXTREME)
                 response = self.session.post(
-                    self.server_url, data=data_to_send, timeout=5,
+                    self.server_url,
+                    data=data_to_send,
+                    timeout=5,
                 )
                 response.raise_for_status()
 
@@ -363,15 +370,20 @@ class HTTPTunnelInterface(Interface):
                     )
 
             if hasattr(self, "_server_thread") and self._server_thread:
-                self._server_thread.join(timeout=2)
+                self._server_thread.join(timeout=5)
 
     def should_ingress_limit(self):
         return False
 
     def __str__(self):
+        name = getattr(self, "name", "?")
         if self.mode == "server":
-            return f"HTTPTunnelInterface[{self.name}/server/{self.listen_host}:{self.listen_port}]"
-        return f"HTTPTunnelInterface[{self.name}/client/{self.server_url}]"
+            lh = getattr(self, "listen_host", "?")
+            lp = getattr(self, "listen_port", "?")
+            return f"HTTPTunnelInterface[{name}/server/{lh}:{lp}]"
+        if self.mode == "client" and getattr(self, "server_url", None) is not None:
+            return f"HTTPTunnelInterface[{name}/client/{self.server_url}]"
+        return f"HTTPTunnelInterface[{name}/{self.mode}]"
 
 
 interface_class = HTTPTunnelInterface

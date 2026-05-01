@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "rns-over-http"
+version = "0.1.0"
+description = "Reticulum interface that tunnels RNS traffic over HTTP POST"
+authors = ["Ivan / Quad4.io"]
+license = "MIT"
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.9"
+rns = ">=1.2.0"
+requests = "^2.30.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
