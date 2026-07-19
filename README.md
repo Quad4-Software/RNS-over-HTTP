@@ -4,6 +4,8 @@
 
 A custom Reticulum interface that tunnels traffic over standard HTTP/S POST requests. This allows Reticulum to operate on networks where only web traffic is permitted, effectively bypassing firewalls, DPI, and other restrictions.
 
+Packet boundaries on the wire use the same simplified HDLC framing as Reticulum's `PipeInterface`, so multiple packets can share one HTTP body without merging.
+
 [Non-GitHub Mirror](https://lavaforge.org/Ivan/RNS-over-HTTP). Also available on the network `RNS-over-HTTP` node.
 
 ## Overview
@@ -19,9 +21,9 @@ The client polls the server with HTTP POST requests, sending any outbound data i
 
 The interface mimics a persistent connection using a long-polling-like mechanism:
 
-1.  The client sends an HTTP POST request to the server, with any pending data in the request body.
-2.  The server receives the request. It processes the data from the client and immediately sends back any data it has queued for the client in the HTTP response body.
-3.  The client receives the response and processes the data.
+1.  The client sends an HTTP POST request to the server, with any pending HDLC-framed packets in the request body.
+2.  The server receives the request. It deframes inbound packets for Reticulum and immediately sends back any queued outbound packets (also HDLC-framed) in the HTTP response body.
+3.  The client receives the response, deframes packets, and hands them to Reticulum.
 4.  After a short, configurable polling interval, the client repeats the process.
 
 This continuous cycle creates a reliable, albeit higher-latency, communication channel.
@@ -30,16 +32,18 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
 
 -   **Firewall & DPI Evasion**: Tunnels any traffic through standard HTTP/S ports (80/443).
 -   **Bidirectional Communication**: Full-duplex data transfer.
--   **Simple setup**: Python, `requests`, and Reticulum (`rns`); use Poetry in this repo for a tidy dev environment and tests.
+-   **Pipe-compatible framing**: HDLC FLAG/ESC framing identical to `PipeInterface`.
+-   **Simple setup**: Python, `requests`, and Reticulum (`rns`). Use Poetry in this repo for a tidy dev environment and tests.
 -   **Reliable**: Automatic connection retry with exponential backoff.
 -   **Flexible**: Supports custom MTU sizes and configurable polling intervals.
 -   **Proxy-Friendly**: Works seamlessly behind reverse proxies like Caddy or Nginx.
+-   **Connection reuse**: HTTP/1.1 keep-alive with a single pooled TCP connection by default, reducing handshake noise visible to DPI.
 
 ## Getting Started
 
 ### Requirements
 
--   Python 3.9 or later
+-   Python 3.10 or later
 -   [Poetry](https://python-poetry.org/docs/#installation) (for a reproducible dev environment and tests)
 
 ### Installation
@@ -55,12 +59,16 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
 ### Tests
 
 ```bash
-poetry run pytest
+# Unit, integration, and fuzz tests
+poetry run pytest -m "not live"
+
+# Full live Reticulum tests (two instances over HTTP + local shared-instance client)
+poetry run pytest -m live
 ```
 
 ## Configuration
 
-Add an interface entry to your Reticulum configuration file (`~/.reticulum/config`) on both the server and client machines.
+Add an interface entry to your Reticulum configuration file (`~/.reticulum/config`) on both the server and client machines. The config `type` must match the module basename (`HTTPInterface`).
 
 ### Server Configuration
 
@@ -87,8 +95,8 @@ The client connects to the server's public URL.
     type = HTTPInterface
     enabled = true
     mode = client
-    server_url = http://your-server-ip-or-domain:8080
-    poll_interval = 1.0
+    server_url = http://your-server-ip-or-domain:8080/
+    poll_interval = 0.1
     mtu = 4096
     user_agent = RNS-HTTP-Tunnel/1.0
 ```
@@ -99,7 +107,7 @@ The client connects to the server's public URL.
 
 -   `mtu`: Maximum Transmission Unit in bytes (default: `4096`).
 -   `name`: Interface name for logging and identification.
--   `user_agent`: User-Agent string to use for HTTP requests (default: `"RNS-HTTP-Tunnel/1.0"`).
+-   `user_agent`: User-Agent string for HTTP requests and server checks (default: `RNS-HTTP-Tunnel/1.0`).
 
 ### Server Mode Options
 
@@ -107,12 +115,20 @@ The client connects to the server's public URL.
 -   `listen_host`: Host to bind the HTTP server to (default: `0.0.0.0`).
 -   `listen_port`: Port to listen on (default: `8080`).
 -   `check_user_agent`: Whether to validate User-Agent headers (default: `true`).
+-   `serve_html_page`: Serve an HTML page on GET `/` (default: `false`).
+-   `html_file_path`: Path to the HTML file used when `serve_html_page` is enabled.
 
 ### Client Mode Options
 
 -   `mode`: Must be set to `client`.
 -   `server_url`: Full URL of the server to connect to (required for client mode).
--   `poll_interval`: Polling interval in seconds (default: `1.0`).
+-   `poll_interval`: Polling interval in seconds (default: `0.1`).
+-   `pool_connections`: Number of urllib3 connection pools to cache (default: `1`).
+-   `pool_maxsize`: Max persistent TCP connections per pool (default: `1`). Keep at `1` for a single long-lived session that looks like normal browser keep-alive.
+
+### Keep-Alive
+
+-   `keepalive_timeout`: Server `Keep-Alive` timeout in seconds (default: `60`). Both sides use HTTP/1.1 `Connection: keep-alive` so polls reuse one TCP socket instead of opening a new connection every request.
 
 ## Reverse Proxy Setup (Caddy Example)
 
@@ -149,8 +165,8 @@ yourdomain.com {
 
 ## Security Considerations
 
--   **Use HTTPS**: Helps bypass some firewalls and DPI that could potentially see reticulum data. 
--   **User-Agent Check**: By default, the server validates the `User-Agent` header (`RNS-HTTP-Tunnel/1.0`). This provides basic protection against web crawlers and casual scanning. If you need to bypass sophisticated DPI, you might consider changing this header in the script to mimic a common browser and disabling the check on the server (`--disable-user-agent-check`).
+-   **Use HTTPS**: Helps bypass some firewalls and DPI that could potentially see reticulum data.
+-   **User-Agent Check**: By default, the server validates the `User-Agent` header (`RNS-HTTP-Tunnel/1.0`). This provides basic protection against web crawlers and casual scanning. To mimic a common browser under sophisticated DPI, set a matching `user_agent` on both sides and keep `check_user_agent = true`, or set `check_user_agent = false` on the server.
 
 ## License
 

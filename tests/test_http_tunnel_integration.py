@@ -8,6 +8,7 @@ import requests
 from RNS.vendor.configobj import ConfigObj
 
 import HTTPInterface as http_mod
+from HTTPInterface import HDLC
 
 HTTPTunnelInterface = http_mod.HTTPTunnelInterface
 
@@ -74,9 +75,38 @@ class RecordingOwner:
         while time.monotonic() < deadline:
             with self._lock:
                 if len(self.packets) >= n:
-                    return self.payloads()
+                    return [bytes(p) for p, _ in self.packets]
             time.sleep(poll)
         return None
+
+
+def make_pair(free_port, poll_interval=0.05, **extra_server):
+    owner_s = RecordingOwner()
+    owner_c = RecordingOwner()
+    srv_lines = [
+        "name = srv",
+        "mode = server",
+        "listen_host = 127.0.0.1",
+        f"listen_port = {free_port}",
+        f"poll_interval = {poll_interval}",
+    ]
+    for k, v in extra_server.items():
+        srv_lines.append(f"{k} = {v}")
+    server = HTTPTunnelInterface(owner_s, configobj_from_lines(srv_lines))
+    wait_tcp_open("127.0.0.1", free_port)
+    url = f"http://127.0.0.1:{free_port}/"
+    client = HTTPTunnelInterface(
+        owner_c,
+        configobj_from_lines(
+            [
+                "name = cli",
+                "mode = client",
+                f"server_url = {url}",
+                f"poll_interval = {poll_interval}",
+            ]
+        ),
+    )
+    return owner_s, owner_c, server, client
 
 
 def test_client_mode_requires_server_url():
@@ -129,30 +159,7 @@ def test_process_outgoing_rejects_over_mtu(free_port):
 
 
 def test_client_payload_reaches_server_owner(free_port):
-    owner_s = RecordingOwner()
-    owner_c = RecordingOwner()
-    srv_cfg = configobj_from_lines(
-        [
-            "name = srv",
-            "mode = server",
-            "listen_host = 127.0.0.1",
-            f"listen_port = {free_port}",
-            "poll_interval = 0.05",
-        ]
-    )
-    server = HTTPTunnelInterface(owner_s, srv_cfg)
-    wait_tcp_open("127.0.0.1", free_port)
-
-    url = f"http://127.0.0.1:{free_port}/"
-    cli_cfg = configobj_from_lines(
-        [
-            "name = cli",
-            "mode = client",
-            f"server_url = {url}",
-            "poll_interval = 0.05",
-        ]
-    )
-    client = HTTPTunnelInterface(owner_c, cli_cfg)
+    owner_s, owner_c, server, client = make_pair(free_port)
     try:
         payload = b"rnstest-bytes-1"
         client.process_outgoing(payload)
@@ -164,30 +171,7 @@ def test_client_payload_reaches_server_owner(free_port):
 
 
 def test_server_payload_reaches_client_owner(free_port):
-    owner_s = RecordingOwner()
-    owner_c = RecordingOwner()
-    srv_cfg = configobj_from_lines(
-        [
-            "name = srv",
-            "mode = server",
-            "listen_host = 127.0.0.1",
-            f"listen_port = {free_port}",
-            "poll_interval = 0.05",
-        ]
-    )
-    server = HTTPTunnelInterface(owner_s, srv_cfg)
-    wait_tcp_open("127.0.0.1", free_port)
-
-    url = f"http://127.0.0.1:{free_port}/"
-    cli_cfg = configobj_from_lines(
-        [
-            "name = cli",
-            "mode = client",
-            f"server_url = {url}",
-            "poll_interval = 0.05",
-        ]
-    )
-    client = HTTPTunnelInterface(owner_c, cli_cfg)
+    owner_s, owner_c, server, client = make_pair(free_port)
     try:
         ping_client_to_server(owner_s, client)
         reply = b"rnstest-reply-2"
@@ -215,7 +199,7 @@ def test_server_rejects_wrong_user_agent(free_port):
         wait_tcp_open("127.0.0.1", free_port)
         r = requests.post(
             f"http://127.0.0.1:{free_port}/",
-            data=b"probe",
+            data=HDLC.frame(b"probe"),
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=5,
         )
@@ -324,71 +308,22 @@ def test_process_incoming_empty_not_forwarded(free_port):
         iface.detach()
 
 
-def test_server_queues_concatenate_to_single_client_delivery(free_port):
-    owner_s = RecordingOwner()
-    owner_c = RecordingOwner()
-    srv_cfg = configobj_from_lines(
-        [
-            "name = srv",
-            "mode = server",
-            "listen_host = 127.0.0.1",
-            f"listen_port = {free_port}",
-            "poll_interval = 0.05",
-        ]
-    )
-    server = HTTPTunnelInterface(owner_s, srv_cfg)
-    wait_tcp_open("127.0.0.1", free_port)
-    url = f"http://127.0.0.1:{free_port}/"
-    cli_cfg = configobj_from_lines(
-        [
-            "name = cli",
-            "mode = client",
-            f"server_url = {url}",
-            "poll_interval = 0.05",
-        ]
-    )
-    client = HTTPTunnelInterface(owner_c, cli_cfg)
+def test_server_queued_packets_arrive_as_separate_frames(free_port):
+    owner_s, owner_c, server, client = make_pair(free_port)
     try:
         ping_client_to_server(owner_s, client)
         server.process_outgoing(b"A")
         server.process_outgoing(b"B")
-        deadline = time.monotonic() + 10.0
-        done = False
-        while time.monotonic() < deadline:
-            if b"".join(owner_c.payloads()) == b"AB":
-                done = True
-                break
-            time.sleep(0.05)
-        assert done is True
+        payloads = owner_c.wait_packet_count_at_least(2, timeout=10.0)
+        assert payloads is not None
+        assert payloads == [b"A", b"B"]
     finally:
         client.detach()
         server.detach()
 
 
 def test_sequential_client_out_two_server_packets(free_port):
-    owner_s = RecordingOwner()
-    owner_c = RecordingOwner()
-    srv_cfg = configobj_from_lines(
-        [
-            "name = srv",
-            "mode = server",
-            "listen_host = 127.0.0.1",
-            f"listen_port = {free_port}",
-            "poll_interval = 0.05",
-        ]
-    )
-    server = HTTPTunnelInterface(owner_s, srv_cfg)
-    wait_tcp_open("127.0.0.1", free_port)
-    url = f"http://127.0.0.1:{free_port}/"
-    cli_cfg = configobj_from_lines(
-        [
-            "name = cli",
-            "mode = client",
-            f"server_url = {url}",
-            "poll_interval = 0.05",
-        ]
-    )
-    client = HTTPTunnelInterface(owner_c, cli_cfg)
+    owner_s, owner_c, server, client = make_pair(free_port)
     try:
         ping_client_to_server(owner_s, client)
         client.process_outgoing(b"\x01first")
@@ -417,7 +352,7 @@ def test_check_user_agent_false_accepts_foreign_ua(free_port):
         wait_tcp_open("127.0.0.1", free_port)
         r = requests.post(
             f"http://127.0.0.1:{free_port}/",
-            data=b"foreign",
+            data=HDLC.frame(b"foreign"),
             headers={"User-Agent": "ForeignAgent/9"},
             timeout=5,
         )
@@ -442,7 +377,7 @@ def test_wrong_post_path_404_never_queues(free_port):
         wait_tcp_open("127.0.0.1", free_port)
         r = requests.post(
             f"http://127.0.0.1:{free_port}/bogus",
-            data=b"x",
+            data=HDLC.frame(b"x"),
             headers={"User-Agent": HTTPTunnelInterface.TUNNEL_USER_AGENT},
             timeout=5,
         )
@@ -477,60 +412,39 @@ def test_serve_html_on_get_when_configured(tmp_path, free_port):
         iface.detach()
 
 
-def test_client_requests_use_tunnel_user_agent_header(free_port):
-    srv_cfg = configobj_from_lines(
-        [
-            "name = srv",
-            "mode = server",
-            "listen_host = 127.0.0.1",
-            f"listen_port = {free_port}",
-            "poll_interval = 0.05",
-        ]
+def test_client_requests_use_configured_user_agent(free_port):
+    custom_ua = "CustomTunnelAgent/2.0"
+    owner_s, owner_c, server, client = make_pair(
+        free_port,
+        user_agent=custom_ua,
     )
-    server = HTTPTunnelInterface(RecordingOwner(), srv_cfg)
-    wait_tcp_open("127.0.0.1", free_port)
+    # rebuild client with matching UA
+    client.detach()
     url = f"http://127.0.0.1:{free_port}/"
-    cli_cfg = configobj_from_lines(
-        [
-            "name = cli",
-            "mode = client",
-            f"server_url = {url}",
-            "poll_interval = 0.05",
-        ]
+    client = HTTPTunnelInterface(
+        owner_c,
+        configobj_from_lines(
+            [
+                "name = cli",
+                "mode = client",
+                f"server_url = {url}",
+                "poll_interval = 0.05",
+                f"user_agent = {custom_ua}",
+            ]
+        ),
     )
-    client = HTTPTunnelInterface(RecordingOwner(), cli_cfg)
     try:
         ua = dict(client.session.headers)["User-Agent"]
-        assert ua == HTTPTunnelInterface.TUNNEL_USER_AGENT
+        assert ua == custom_ua
+        client.process_outgoing(b"ua-ok")
+        assert owner_s.last_payload(timeout=8.0) == b"ua-ok"
     finally:
         client.detach()
         server.detach()
 
 
 def test_counters_after_tunnel_roundtrip_stay_consistent(free_port):
-    owner_s = RecordingOwner()
-    owner_c = RecordingOwner()
-    srv_cfg = configobj_from_lines(
-        [
-            "name = srv",
-            "mode = server",
-            "listen_host = 127.0.0.1",
-            f"listen_port = {free_port}",
-            "poll_interval = 0.05",
-        ]
-    )
-    server = HTTPTunnelInterface(owner_s, srv_cfg)
-    wait_tcp_open("127.0.0.1", free_port)
-    url = f"http://127.0.0.1:{free_port}/"
-    cli_cfg = configobj_from_lines(
-        [
-            "name = cli",
-            "mode = client",
-            f"server_url = {url}",
-            "poll_interval = 0.05",
-        ]
-    )
-    client = HTTPTunnelInterface(owner_c, cli_cfg)
+    owner_s, owner_c, server, client = make_pair(free_port)
     try:
         p = b"dcounter-test"
         client.process_outgoing(p)
@@ -553,3 +467,90 @@ def test_subclass_matches_rns_interface():
     from RNS.Interfaces.Interface import Interface
 
     assert issubclass(HTTPTunnelInterface, Interface)
+    assert http_mod.interface_class is HTTPTunnelInterface
+
+
+def test_payloads_with_flag_and_esc_bytes_survive_roundtrip(free_port):
+    owner_s, owner_c, server, client = make_pair(free_port)
+    try:
+        payload = bytes([HDLC.FLAG, 0x00, HDLC.ESC, 0xFF, HDLC.FLAG, HDLC.ESC])
+        client.process_outgoing(payload)
+        assert owner_s.last_payload(timeout=8.0) == payload
+    finally:
+        client.detach()
+        server.detach()
+
+
+def test_client_reuses_single_pooled_tcp_connection(free_port):
+    owner_s, owner_c, server, client = make_pair(free_port, poll_interval=0.05)
+    try:
+        expected = []
+        for i in range(8):
+            payload = f"pool-{i}".encode()
+            expected.append(payload)
+            client.process_outgoing(payload)
+
+        payloads = owner_s.wait_packet_count_at_least(8, timeout=15.0)
+        assert payloads is not None
+        assert payloads[-8:] == expected
+
+        deadline = time.monotonic() + 5.0
+        stats = {}
+        while time.monotonic() < deadline:
+            stats = server.connection_stats()
+            if stats.get("http_requests", 0) >= 8 and stats.get("tcp_accepts", 0) >= 1:
+                break
+            time.sleep(0.05)
+
+        assert stats["http_requests"] >= 8
+        # wait_tcp_open probes once, then the client should reuse a single TCP session
+        assert stats["tcp_accepts"] <= 2
+        assert stats["http_requests"] > stats["tcp_accepts"]
+
+        cstats = client.connection_stats()
+        assert cstats.get("pool_num_connections", 0) == 1
+        assert cstats.get("pool_num_requests", 0) >= 8
+        assert client.session.headers.get("Connection") == "keep-alive"
+    finally:
+        client.detach()
+        server.detach()
+
+
+def test_server_advertises_http11_keepalive_headers(free_port):
+    owner_s, owner_c, server, client = make_pair(
+        free_port,
+        poll_interval=0.05,
+        keepalive_timeout=45,
+    )
+    try:
+        ping_client_to_server(owner_s, client)
+        r = requests.post(
+            f"http://127.0.0.1:{free_port}/",
+            data=HDLC.frame(b"hdr"),
+            headers={
+                "User-Agent": HTTPTunnelInterface.TUNNEL_USER_AGENT,
+                "Connection": "keep-alive",
+            },
+            timeout=5,
+        )
+        assert r.status_code == 200
+        assert r.headers.get("Connection", "").lower() == "keep-alive"
+        assert "timeout=45" in r.headers.get("Keep-Alive", "")
+    finally:
+        client.detach()
+        server.detach()
+
+
+def test_invalid_pool_size_rejected():
+    with pytest.raises(ValueError, match="pool_connections"):
+        HTTPTunnelInterface(
+            RecordingOwner(),
+            configobj_from_lines(
+                [
+                    "name = c",
+                    "mode = client",
+                    "server_url = http://127.0.0.1:9/",
+                    "pool_maxsize = 0",
+                ]
+            ),
+        )
