@@ -1,13 +1,16 @@
+import asyncio
 import os
 import socket
+import ssl
 import threading
+from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from queue import Empty, Queue
 from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
 
-import requests
+import httpx
 import RNS
-from requests.adapters import HTTPAdapter
 from RNS.Interfaces.Interface import Interface
 
 
@@ -40,11 +43,7 @@ class HDLC:
 
     @staticmethod
     def deframe(buffer, max_frame_len):
-        """Yield complete packets from a byte buffer.
-
-        Returns (packets, remainder) where remainder is unconsumed bytes
-        that may form the start of an incomplete frame.
-        """
+        """Return (packets, remainder) from an HDLC byte buffer."""
         packets = []
         in_frame = False
         escape = False
@@ -82,29 +81,187 @@ class HDLC:
         return packets, remainder
 
 
+class _H3Session:
+    """Persistent HTTP/3 client over one QUIC connection."""
+
+    def __init__(self, server_url, user_agent, verify=True, ca_certs=None):
+        from aioquic.asyncio import connect
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.h3.connection import H3_ALPN, H3Connection
+        from aioquic.h3.events import DataReceived, HeadersReceived
+        from aioquic.quic.configuration import QuicConfiguration
+        from aioquic.quic.events import QuicEvent
+
+        parsed = urlparse(server_url)
+        if parsed.scheme != "https":
+            raise ValueError("HTTP/3 requires an https:// server_url")
+
+        self._host = parsed.hostname
+        self._port = parsed.port or 443
+        self._path = parsed.path or "/"
+        if parsed.query:
+            self._path += "?" + parsed.query
+        self._authority = parsed.netloc
+        self._user_agent = user_agent
+        self._closed = False
+        self._request_count = 0
+
+        configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+        if not verify:
+            configuration.verify_mode = ssl.CERT_NONE
+        elif ca_certs:
+            configuration.load_verify_locations(ca_certs)
+
+        class _Client(QuicConnectionProtocol):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._http = H3Connection(self._quic)
+                self._request_events = {}
+                self._request_waiter = {}
+
+            def http_event_received(self, event):
+                if isinstance(event, (HeadersReceived, DataReceived)):
+                    stream_id = event.stream_id
+                    if stream_id in self._request_events:
+                        self._request_events[stream_id].append(event)
+                        if event.stream_ended:
+                            waiter = self._request_waiter.pop(stream_id)
+                            waiter.set_result(self._request_events.pop(stream_id))
+
+            def quic_event_received(self, event: QuicEvent):
+                for http_event in self._http.handle_event(event):
+                    self.http_event_received(http_event)
+
+            async def post_bytes(self, path, authority, user_agent, data):
+                stream_id = self._quic.get_next_available_stream_id()
+                headers = [
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", authority.encode()),
+                    (b":path", path.encode()),
+                    (b"user-agent", user_agent.encode()),
+                    (b"content-type", b"application/octet-stream"),
+                    (b"content-length", str(len(data)).encode()),
+                ]
+                self._http.send_headers(
+                    stream_id=stream_id,
+                    headers=headers,
+                    end_stream=not data,
+                )
+                if data:
+                    self._http.send_data(stream_id=stream_id, data=data, end_stream=True)
+
+                waiter = self._loop.create_future()
+                self._request_events[stream_id] = deque()
+                self._request_waiter[stream_id] = waiter
+                self.transmit()
+                events = await asyncio.shield(waiter)
+
+                status = 0
+                body = b""
+                for event in events:
+                    if isinstance(event, HeadersReceived):
+                        for key, value in event.headers:
+                            if key == b":status":
+                                status = int(value.decode())
+                    elif isinstance(event, DataReceived):
+                        body += event.data
+                return status, body
+
+        self._Client = _Client
+        self._connect = connect
+        self._configuration = configuration
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._run_loop,
+            name="h3-client-loop",
+            daemon=True,
+        )
+        self._ready = threading.Event()
+        self._error = None
+        self._client = None
+        self._cm = None
+        self._loop_thread.start()
+        if not self._ready.wait(timeout=30):
+            raise TimeoutError("HTTP/3 client failed to connect")
+        if self._error is not None:
+            raise self._error
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._open())
+            self._ready.set()
+            self._loop.run_forever()
+        except Exception as exc:
+            self._error = exc
+            self._ready.set()
+
+    async def _open(self):
+        self._cm = self._connect(
+            self._host,
+            self._port,
+            configuration=self._configuration,
+            create_protocol=self._Client,
+        )
+        self._client = await self._cm.__aenter__()
+
+    def post(self, data, timeout=10.0):
+        if self._closed:
+            raise RuntimeError("HTTP/3 session is closed")
+
+        async def _do_post():
+            status, body = await self._client.post_bytes(
+                self._path,
+                self._authority,
+                self._user_agent,
+                data,
+            )
+            self._request_count += 1
+            if status >= 400:
+                raise RuntimeError(f"HTTP/3 status {status}")
+            return body
+
+        fut = asyncio.run_coroutine_threadsafe(_do_post(), self._loop)
+        return fut.result(timeout=timeout)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+
+        async def _close():
+            if self._cm is not None:
+                await self._cm.__aexit__(None, None, None)
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_close(), self._loop)
+            fut.result(timeout=5)
+        except Exception:
+            pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._loop_thread.join(timeout=5)
+
+
 class HTTPTunnelInterface(Interface):
     """HTTP Tunnel Interface for Reticulum.
 
     Bidirectional RNS transport over HTTP POST with pipe-compatible HDLC
-    framing on request and response bodies. Uses HTTP/1.1 keep-alive and a
-    small urllib3 connection pool so the client reuses one TCP session.
+    framing. Supports HTTP/1.1 (default), HTTP/2, and HTTP/3.
 
-    Configuration:
-        mode: "client" or "server" (tunnel role)
-        listen_host: bind address (server mode)
-        listen_port: bind port (server mode)
-        server_url: URL of the HTTP server (client mode)
-        poll_interval: client poll interval in seconds (default: 0.1)
-        check_user_agent: validate User-Agent on server (default: True)
-        user_agent: User-Agent string (default: RNS-HTTP-Tunnel/1.0)
-        serve_html_page: serve HTML on GET / (default: False)
-        html_file_path: path to HTML camouflage file
-        mtu: hardware MTU (default: 4096)
-        pool_connections: urllib3 pools to cache (client, default: 1)
-        pool_maxsize: max persistent connections per pool (client, default: 1)
-        keepalive_timeout: Keep-Alive timeout seconds advertised by server (default: 60)
+    Engineering defaults:
+      - http_version=1 uses a stdlib HTTP/1.1 server and httpx client.
+        Works over cleartext http:// and is ideal behind Caddy/nginx.
+      - http_version=2 requires TLS and uses Hypercorn (h2) + httpx(http2).
+      - http_version=3 requires TLS and uses Hypercorn QUIC + a persistent
+        aioquic HTTP/3 client session.
 
-    Config type must match module basename (HTTPInterface.py -> HTTPInterface).
+    Configuration highlights:
+        http_version: 1, 2, or 3 (default: 1)
+        tls_certfile / tls_keyfile: required for versions 2 and 3 on server
+        tls_verify: verify TLS certs on client (default: true)
+        tls_ca_certs: optional CA bundle path for client verify
+        server_url: use https:// for versions 2 and 3
     """
 
     DEFAULT_IFAC_SIZE = 16
@@ -117,6 +274,7 @@ class HTTPTunnelInterface(Interface):
     DEFAULT_POOL_CONNECTIONS = 1
     DEFAULT_POOL_MAXSIZE = 1
     DEFAULT_KEEPALIVE_TIMEOUT = 60
+    DEFAULT_HTTP_VERSION = 1
 
     def __init__(self, owner, configuration):
         super().__init__()
@@ -164,12 +322,29 @@ class HTTPTunnelInterface(Interface):
             if "keepalive_timeout" in ifconf
             else self.DEFAULT_KEEPALIVE_TIMEOUT
         )
+        http_version = (
+            int(ifconf["http_version"])
+            if "http_version" in ifconf
+            else self.DEFAULT_HTTP_VERSION
+        )
+        tls_certfile = ifconf["tls_certfile"] if "tls_certfile" in ifconf else None
+        tls_keyfile = ifconf["tls_keyfile"] if "tls_keyfile" in ifconf else None
+        tls_verify = (
+            ifconf.as_bool("tls_verify") if "tls_verify" in ifconf else True
+        )
+        tls_ca_certs = ifconf["tls_ca_certs"] if "tls_ca_certs" in ifconf else None
 
         self.mode = mode
+        self.http_version = http_version
 
         if mode not in ["client", "server"]:
             raise ValueError(
                 f"Invalid mode '{mode}' for {self}. Must be 'client' or 'server'",
+            )
+
+        if http_version not in (1, 2, 3):
+            raise ValueError(
+                f"Invalid http_version '{http_version}' for {self}. Must be 1, 2, or 3",
             )
 
         if mode == "client" and server_url is None:
@@ -179,6 +354,19 @@ class HTTPTunnelInterface(Interface):
             raise ValueError(
                 f"pool_connections and pool_maxsize must be >= 1 for {self}",
             )
+
+        if http_version >= 2:
+            if mode == "server" and (not tls_certfile or not tls_keyfile):
+                raise ValueError(
+                    f"tls_certfile and tls_keyfile are required for "
+                    f"HTTP/{http_version} server mode in {self}",
+                )
+            if mode == "client":
+                parsed = urlparse(server_url)
+                if parsed.scheme != "https":
+                    raise ValueError(
+                        f"HTTP/{http_version} client requires https:// server_url in {self}",
+                    )
 
         self.owner = owner
         self.IN = True
@@ -191,9 +379,19 @@ class HTTPTunnelInterface(Interface):
         self.pool_connections = pool_connections
         self.pool_maxsize = pool_maxsize
         self.keepalive_timeout = keepalive_timeout
+        self.tls_certfile = tls_certfile
+        self.tls_keyfile = tls_keyfile
+        self.tls_verify = tls_verify
+        self.tls_ca_certs = tls_ca_certs
         self._tcp_accepts = 0
         self._http_requests = 0
         self._stats_lock = threading.Lock()
+        self._last_http_version = None
+        self._client_requests = 0
+        self.session = None
+        self._h3_session = None
+        self._asgi_shutdown = None
+        self._asgi_loop = None
 
         if self.serve_html_page and self.html_file_path:
             self._load_html_content()
@@ -218,7 +416,10 @@ class HTTPTunnelInterface(Interface):
         self.optimise_mtu()
 
         if mode == "server":
-            self.setup_server()
+            if http_version == 1:
+                self.setup_server_http1()
+            else:
+                self.setup_server_asgi()
         else:
             self.setup_client()
 
@@ -239,7 +440,6 @@ class HTTPTunnelInterface(Interface):
             self.html_content = None
 
     def _drain_send_frames(self):
-        """Take all queued packets and return HDLC-framed wire bytes."""
         parts = []
         while not self._send_queue.empty():
             try:
@@ -251,7 +451,6 @@ class HTTPTunnelInterface(Interface):
         return b"".join(parts)
 
     def _ingest_wire_bytes(self, wire_data):
-        """Deframe HDLC wire bytes and deliver each packet inbound."""
         if not wire_data:
             return
 
@@ -267,31 +466,100 @@ class HTTPTunnelInterface(Interface):
         with self._stats_lock:
             self._http_requests += 1
 
+    def _handle_tunnel_exchange(self, method, path, headers, body):
+        """Shared request handler for HTTP/1.1 and ASGI paths.
+
+        Returns (status, content_type, response_body).
+        """
+        self._record_http_request()
+        headers_l = {str(k).lower(): str(v) for k, v in headers.items()}
+
+        if method == "GET" and path == "/":
+            if self.serve_html_page and self.html_content:
+                return (
+                    200,
+                    "text/html; charset=utf-8",
+                    self.html_content.encode("utf-8"),
+                )
+            return 404, "text/plain", b""
+
+        if method == "POST" and path == "/":
+            if self.check_user_agent:
+                user_agent = headers_l.get("user-agent", "")
+                if user_agent != self.user_agent:
+                    RNS.log(
+                        f"Rejected request with invalid User-Agent: {user_agent}",
+                        RNS.LOG_WARNING,
+                    )
+                    return 403, "text/plain", b"Forbidden"
+
+            if body:
+                RNS.log(f"Received {len(body)} bytes from client", RNS.LOG_EXTREME)
+                self._ingest_wire_bytes(body)
+
+            server_data = self._drain_send_frames()
+            if server_data:
+                RNS.log(
+                    f"Sending {len(server_data)} framed bytes to client",
+                    RNS.LOG_EXTREME,
+                )
+            return 200, "application/octet-stream", server_data
+
+        return 404, "text/plain", b""
+
     def connection_stats(self):
-        """Return TCP accept and HTTP request counters (server) or pool stats (client)."""
         with self._stats_lock:
             stats = {
                 "tcp_accepts": self._tcp_accepts,
                 "http_requests": self._http_requests,
+                "client_requests": self._client_requests,
+                "last_http_version": self._last_http_version,
+                "configured_http_version": self.http_version,
             }
-        if self.mode == "client" and getattr(self, "session", None) is not None:
-            try:
-                adapter = self.session.get_adapter(self.server_url)
-                num_connections = 0
-                num_requests = 0
-                for key in list(adapter.poolmanager.pools.keys()):
-                    pool = adapter.poolmanager.pools.get(key)
-                    if pool is None:
-                        continue
-                    num_connections += getattr(pool, "num_connections", 0)
-                    num_requests += getattr(pool, "num_requests", 0)
-                stats["pool_num_connections"] = num_connections
-                stats["pool_num_requests"] = num_requests
-            except Exception:
-                pass
+        if self._h3_session is not None:
+            stats["pool_num_connections"] = 0 if self._h3_session._closed else 1
+            stats["pool_num_requests"] = self._h3_session._request_count
         return stats
 
-    def setup_server(self):
+    def _build_asgi_app(self):
+        interface = self
+
+        async def app(scope, receive, send):
+            if scope["type"] != "http":
+                return
+
+            headers = {
+                key.decode("latin1"): value.decode("latin1")
+                for key, value in scope.get("headers", [])
+            }
+            body = b""
+            while True:
+                message = await receive()
+                body += message.get("body", b"")
+                if not message.get("more_body", False):
+                    break
+
+            status, content_type, response_body = interface._handle_tunnel_exchange(
+                scope.get("method", "GET"),
+                scope.get("path", "/"),
+                headers,
+                body,
+            )
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": status,
+                    "headers": [
+                        (b"content-type", content_type.encode()),
+                        (b"content-length", str(len(response_body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": response_body})
+
+        return app
+
+    def setup_server_http1(self):
         interface_instance = self
 
         class TunnelRequestHandler(BaseHTTPRequestHandler):
@@ -307,69 +575,32 @@ class HTTPTunnelInterface(Interface):
                 )
 
             def do_GET(self):
-                interface_instance._record_http_request()
-                if (
-                    self.path == "/"
-                    and interface_instance.serve_html_page
-                    and interface_instance.html_content
-                ):
-                    body = interface_instance.html_content.encode("utf-8")
-                    self.send_response(200)
-                    self._send_common_headers("text/html; charset=utf-8", len(body))
-                    self.end_headers()
+                status, content_type, body = interface_instance._handle_tunnel_exchange(
+                    "GET",
+                    self.path,
+                    self.headers,
+                    b"",
+                )
+                self.send_response(status)
+                self._send_common_headers(content_type, len(body))
+                self.end_headers()
+                if body:
                     self.wfile.write(body)
-                else:
-                    self.send_response(404)
-                    self._send_common_headers("text/plain", 0)
-                    self.end_headers()
 
             def do_POST(self):
-                interface_instance._record_http_request()
-                if self.path == "/":
-                    if interface_instance.check_user_agent:
-                        user_agent = self.headers.get("User-Agent", "")
-                        if user_agent != interface_instance.user_agent:
-                            RNS.log(
-                                f"Rejected request with invalid User-Agent: {user_agent}",
-                                RNS.LOG_WARNING,
-                            )
-                            body = b"Forbidden"
-                            self.send_response(403)
-                            self._send_common_headers("text/plain", len(body))
-                            self.end_headers()
-                            self.wfile.write(body)
-                            return
-
-                    content_length = int(self.headers.get("Content-Length", 0))
-                    client_data = (
-                        self.rfile.read(content_length) if content_length > 0 else b""
-                    )
-
-                    if client_data:
-                        RNS.log(
-                            f"Received {len(client_data)} bytes from client",
-                            RNS.LOG_EXTREME,
-                        )
-                        interface_instance._ingest_wire_bytes(client_data)
-
-                    server_data = interface_instance._drain_send_frames()
-                    if server_data:
-                        RNS.log(
-                            f"Sending {len(server_data)} framed bytes to client",
-                            RNS.LOG_EXTREME,
-                        )
-
-                    self.send_response(200)
-                    self._send_common_headers(
-                        "application/octet-stream",
-                        len(server_data),
-                    )
-                    self.end_headers()
-                    self.wfile.write(server_data)
-                else:
-                    self.send_response(404)
-                    self._send_common_headers("text/plain", 0)
-                    self.end_headers()
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length) if content_length > 0 else b""
+                status, content_type, response = interface_instance._handle_tunnel_exchange(
+                    "POST",
+                    self.path,
+                    self.headers,
+                    body,
+                )
+                self.send_response(status)
+                self._send_common_headers(content_type, len(response))
+                self.end_headers()
+                if response:
+                    self.wfile.write(response)
 
             def log_message(self, fmt, *args):
                 pass
@@ -404,48 +635,95 @@ class HTTPTunnelInterface(Interface):
 
         self._server_thread = threading.Thread(target=run_server, daemon=True)
         self._server_thread.start()
-
-        thread = threading.Thread(target=self.receive_loop)
-        thread.daemon = True
-        thread.start()
-
+        self._start_receive_loop()
         self.online = True
         RNS.log(
-            f"HTTP server started on http://{self.listen_host}:{self.listen_port} "
-            f"(HTTP/1.1 keep-alive timeout={self.keepalive_timeout}s)",
+            f"HTTP/1.1 server started on http://{self.listen_host}:{self.listen_port}",
             RNS.LOG_NOTICE,
         )
 
+    def setup_server_asgi(self):
+        from hypercorn.asyncio import serve
+        from hypercorn.config import Config
+
+        config = Config()
+        bind = f"{self.listen_host}:{self.listen_port}"
+        config.bind = [bind]
+        config.certfile = self.tls_certfile
+        config.keyfile = self.tls_keyfile
+        config.alpn_protocols = ["h2", "http/1.1"]
+        if self.http_version == 3:
+            config.quic_bind = [bind]
+            config.alpn_protocols = ["h3", "h2", "http/1.1"]
+
+        app = self._build_asgi_app()
+        self._asgi_shutdown = asyncio.Event()
+
+        def run_server():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._asgi_loop = loop
+            try:
+                loop.run_until_complete(
+                    serve(app, config, shutdown_trigger=self._asgi_shutdown.wait),
+                )
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    RNS.log(f"ASGI HTTP server error for {self}: {e}", RNS.LOG_ERROR)
+                    if RNS.Reticulum.panic_on_interface_error:
+                        RNS.panic()
+            finally:
+                loop.close()
+
+        self._server_thread = threading.Thread(target=run_server, daemon=True)
+        self._server_thread.start()
+        self._start_receive_loop()
+        self.online = True
+        proto = f"HTTP/{self.http_version}"
+        RNS.log(
+            f"{proto} server started on https://{self.listen_host}:{self.listen_port}",
+            RNS.LOG_NOTICE,
+        )
+
+    def _start_receive_loop(self):
+        thread = threading.Thread(target=self.receive_loop, daemon=True)
+        thread.start()
+
     def setup_client(self):
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": self.user_agent,
-                "Connection": "keep-alive",
-                "Accept-Encoding": "identity",
-            }
-        )
-        adapter = HTTPAdapter(
-            pool_connections=self.pool_connections,
-            pool_maxsize=self.pool_maxsize,
-            max_retries=0,
-            pool_block=True,
-        )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        self._http_adapter = adapter
         self._consecutive_failures = 0
         self._max_backoff = 30.0
 
-        thread = threading.Thread(target=self.client_loop)
-        thread.daemon = True
-        thread.start()
+        if self.http_version == 3:
+            self._h3_session = _H3Session(
+                self.server_url,
+                self.user_agent,
+                verify=self.tls_verify,
+                ca_certs=self.tls_ca_certs,
+            )
+            self._last_http_version = "HTTP/3"
+        else:
+            verify = self.tls_ca_certs if self.tls_ca_certs else self.tls_verify
+            limits = httpx.Limits(
+                max_connections=max(self.pool_maxsize, 1),
+                max_keepalive_connections=max(self.pool_maxsize, 1),
+                keepalive_expiry=float(self.keepalive_timeout),
+            )
+            self.session = httpx.Client(
+                http2=(self.http_version == 2),
+                verify=verify,
+                headers={
+                    "User-Agent": self.user_agent,
+                    "Accept-Encoding": "identity",
+                },
+                limits=limits,
+                timeout=httpx.Timeout(5.0),
+            )
 
+        thread = threading.Thread(target=self.client_loop, daemon=True)
+        thread.start()
         self.online = True
         RNS.log(
-            f"HTTP client started, connecting to {self.server_url} "
-            f"(pool_connections={self.pool_connections}, "
-            f"pool_maxsize={self.pool_maxsize})",
+            f"HTTP/{self.http_version} client started, connecting to {self.server_url}",
             RNS.LOG_NOTICE,
         )
 
@@ -461,6 +739,19 @@ class HTTPTunnelInterface(Interface):
                 if not self._stop_event.is_set():
                     RNS.log(f"Error in receive loop for {self}: {e}", RNS.LOG_ERROR)
 
+    def _client_exchange(self, data_to_send):
+        if self.http_version == 3:
+            body = self._h3_session.post(data_to_send, timeout=5.0)
+            self._client_requests += 1
+            self._last_http_version = "HTTP/3"
+            return body
+
+        response = self.session.post(self.server_url, content=data_to_send)
+        response.raise_for_status()
+        self._client_requests += 1
+        self._last_http_version = response.http_version
+        return response.content
+
     def client_loop(self):
         while not self._stop_event.is_set():
             data_to_send = self._drain_send_frames()
@@ -470,20 +761,14 @@ class HTTPTunnelInterface(Interface):
                     f"Sending {len(data_to_send)} framed bytes to server",
                     RNS.LOG_EXTREME,
                 )
-                response = self.session.post(
-                    self.server_url,
-                    data=data_to_send,
-                    timeout=5,
-                    headers={"Connection": "keep-alive"},
-                )
-                response.raise_for_status()
+                content = self._client_exchange(data_to_send)
 
-                if response.content:
+                if content:
                     RNS.log(
-                        f"Received {len(response.content)} bytes from server",
+                        f"Received {len(content)} bytes from server",
                         RNS.LOG_EXTREME,
                     )
-                    self._ingest_wire_bytes(response.content)
+                    self._ingest_wire_bytes(content)
 
                     while not self._recv_queue.empty():
                         try:
@@ -497,7 +782,7 @@ class HTTPTunnelInterface(Interface):
                     RNS.log(f"Reconnected to server for {self}", RNS.LOG_INFO)
                     self._consecutive_failures = 0
 
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 if self._stop_event.is_set():
                     break
                 self._consecutive_failures += 1
@@ -543,48 +828,67 @@ class HTTPTunnelInterface(Interface):
         self._stop_event.set()
         self.online = False
 
-        if self.mode == "client" and getattr(self, "session", None) is not None:
-            try:
-                self.session.close()
-            except Exception as e:
-                RNS.log(f"Error closing HTTP session for {self}: {e}", RNS.LOG_DEBUG)
+        if self.mode == "client":
+            if self.session is not None:
+                try:
+                    self.session.close()
+                except Exception as e:
+                    RNS.log(
+                        f"Error closing HTTP session for {self}: {e}",
+                        RNS.LOG_DEBUG,
+                    )
+            if self._h3_session is not None:
+                try:
+                    self._h3_session.close()
+                except Exception as e:
+                    RNS.log(
+                        f"Error closing HTTP/3 session for {self}: {e}",
+                        RNS.LOG_DEBUG,
+                    )
 
         if self.mode == "server":
-            httpd = getattr(self, "_http_server", None)
-            if httpd is not None:
-                def _shutdown():
-                    try:
-                        httpd.shutdown()
-                    except Exception:
-                        pass
-                    try:
-                        httpd.server_close()
-                    except Exception:
-                        pass
+            if self.http_version == 1:
+                httpd = getattr(self, "_http_server", None)
+                if httpd is not None:
+                    def _shutdown():
+                        try:
+                            httpd.shutdown()
+                        except Exception:
+                            pass
+                        try:
+                            httpd.server_close()
+                        except Exception:
+                            pass
 
-                threading.Thread(target=_shutdown, daemon=True).start()
+                    threading.Thread(target=_shutdown, daemon=True).start()
 
-            if hasattr(self, "_server_thread") and self._server_thread:
-                self._server_thread.join(timeout=2)
-                if self._server_thread.is_alive() and httpd is not None:
-                    try:
-                        httpd.socket.close()
-                    except Exception:
-                        pass
-                    self._server_thread.join(timeout=1)
+                if hasattr(self, "_server_thread") and self._server_thread:
+                    self._server_thread.join(timeout=2)
+                    if self._server_thread.is_alive() and httpd is not None:
+                        try:
+                            httpd.socket.close()
+                        except Exception:
+                            pass
+                        self._server_thread.join(timeout=1)
+            else:
+                if self._asgi_loop is not None and self._asgi_shutdown is not None:
+                    self._asgi_loop.call_soon_threadsafe(self._asgi_shutdown.set)
+                if hasattr(self, "_server_thread") and self._server_thread:
+                    self._server_thread.join(timeout=5)
 
     def should_ingress_limit(self):
         return False
 
     def __str__(self):
         name = getattr(self, "name", "?")
+        ver = getattr(self, "http_version", "?")
         if self.mode == "server":
             lh = getattr(self, "listen_host", "?")
             lp = getattr(self, "listen_port", "?")
-            return f"HTTPTunnelInterface[{name}/server/{lh}:{lp}]"
+            return f"HTTPTunnelInterface[{name}/HTTP{ver}/server/{lh}:{lp}]"
         if self.mode == "client" and getattr(self, "server_url", None) is not None:
-            return f"HTTPTunnelInterface[{name}/client/{self.server_url}]"
-        return f"HTTPTunnelInterface[{name}/{self.mode}]"
+            return f"HTTPTunnelInterface[{name}/HTTP{ver}/client/{self.server_url}]"
+        return f"HTTPTunnelInterface[{name}/HTTP{ver}/{self.mode}]"
 
 
 interface_class = HTTPTunnelInterface

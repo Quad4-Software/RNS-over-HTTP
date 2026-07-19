@@ -33,11 +33,12 @@ This continuous cycle creates a reliable, albeit higher-latency, communication c
 -   **Firewall & DPI Evasion**: Tunnels any traffic through standard HTTP/S ports (80/443).
 -   **Bidirectional Communication**: Full-duplex data transfer.
 -   **Pipe-compatible framing**: HDLC FLAG/ESC framing identical to `PipeInterface`.
--   **Simple setup**: Python, `requests`, and Reticulum (`rns`). Use Poetry in this repo for a tidy dev environment and tests.
+-   **Simple setup**: Python, `httpx`, Hypercorn/aioquic for HTTP/2–3, and Reticulum (`rns`). Use Poetry in this repo for deps and tests.
 -   **Reliable**: Automatic connection retry with exponential backoff.
 -   **Flexible**: Supports custom MTU sizes and configurable polling intervals.
 -   **Proxy-Friendly**: Works seamlessly behind reverse proxies like Caddy or Nginx.
--   **Connection reuse**: HTTP/1.1 keep-alive with a single pooled TCP connection by default, reducing handshake noise visible to DPI.
+-   **Connection reuse**: Keep-alive / multiplexed sessions by default, reducing handshake noise visible to DPI.
+-   **HTTP/1.1, HTTP/2, and HTTP/3**: Choose the version that matches your path. Default stays HTTP/1.1 for cleartext and reverse-proxy backends.
 
 ## Getting Started
 
@@ -123,12 +124,39 @@ The client connects to the server's public URL.
 -   `mode`: Must be set to `client`.
 -   `server_url`: Full URL of the server to connect to (required for client mode).
 -   `poll_interval`: Polling interval in seconds (default: `0.1`).
--   `pool_connections`: Number of urllib3 connection pools to cache (default: `1`).
--   `pool_maxsize`: Max persistent TCP connections per pool (default: `1`). Keep at `1` for a single long-lived session that looks like normal browser keep-alive.
+-   `pool_connections` / `pool_maxsize`: Keepalive pool sizing for HTTP/1.1 and HTTP/2 (default: `1`).
 
-### Keep-Alive
+### HTTP Version and TLS
 
--   `keepalive_timeout`: Server `Keep-Alive` timeout in seconds (default: `60`). Both sides use HTTP/1.1 `Connection: keep-alive` so polls reuse one TCP socket instead of opening a new connection every request.
+-   `http_version`: `1` (default), `2`, or `3`.
+-   **HTTP/1.1**: cleartext `http://` or TLS. Best behind Caddy/nginx that already terminate HTTP/2 or HTTP/3.
+-   **HTTP/2**: requires `https://` and server `tls_certfile` / `tls_keyfile`. Client uses `httpx` with ALPN `h2`.
+-   **HTTP/3**: requires `https://` and the same TLS files. Server enables Hypercorn QUIC bind. Client keeps one aioquic QUIC session across polls.
+-   `tls_verify`: client certificate verification (default: `true`). Set `false` only for lab/self-signed setups.
+-   `tls_ca_certs`: optional CA bundle path for client verification.
+-   `keepalive_timeout`: idle keepalive budget in seconds (default: `60`).
+
+Example HTTP/2 server/client:
+
+```ini
+[[HTTP Server Interface]]
+    type = HTTPInterface
+    enabled = true
+    mode = server
+    http_version = 2
+    listen_host = 0.0.0.0
+    listen_port = 443
+    tls_certfile = /path/to/fullchain.pem
+    tls_keyfile = /path/to/privkey.pem
+
+[[HTTP Client Interface]]
+    type = HTTPInterface
+    enabled = true
+    mode = client
+    http_version = 2
+    server_url = https://your-server.example/
+    tls_verify = true
+```
 
 ## Reverse Proxy Setup (Caddy Example)
 
